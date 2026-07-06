@@ -18,14 +18,12 @@ load_dotenv()
 # Model fallback chain — tried in order until one succeeds
 # ─────────────────────────────────────────────────────────────────
 MODELS_FALLBACK = [
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash-lite-001",
-    "gemini-flash-lite-latest",
-    "gemini-flash-latest",
 ]
 
 # ─────────────────────────────────────────────────────────────────
