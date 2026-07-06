@@ -58,6 +58,112 @@ def query_knowledge_base(category: str = None, topic: str = None) -> list:
 
 
 # ==========================================
+# 1b. USER LOOKUP TOOL
+# ==========================================
+def lookup_user(username: str) -> dict:
+    """
+    Looks up a user and their associated device from the database.
+    Used by gather_info_node to validate a user exists and populate
+    the working memory with their device context.
+
+    Args:
+        username (str): The employee username to look up.
+
+    Returns:
+        dict: User profile and device details, or an error if not found.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM users WHERE username = ?;", (username,))
+    user = cursor.fetchone()
+
+    if not user:
+        conn.close()
+        return {
+            "found": False,
+            "message": f"User '{username}' not found in the employee registry."
+        }
+
+    cursor.execute("SELECT * FROM devices WHERE username = ?;", (username,))
+    device = cursor.fetchone()
+    conn.close()
+
+    return {
+        "found": True,
+        "username": user["username"],
+        "full_name": user["full_name"],
+        "email": user["email"],
+        "department": user["department"],
+        "device_id": device["device_id"] if device else None,
+        "os": device["os"] if device else None,
+        "ip_address": device["ip_address"] if device else None,
+        "vpn_configured": bool(device["vpn_configured"]) if device else False,
+        "last_patch_date": device["last_patch_date"] if device else None,
+    }
+
+
+# ==========================================
+# 1c. INTENT MATCHING TOOL
+# ==========================================
+def match_intent_from_symptoms(user_text: str) -> dict:
+    """
+    Deterministically matches user free-text input against grounded KB symptom
+    keyword lists to identify the most likely troubleshooting category and topic.
+    Used by route_input_node to classify intent without hallucination.
+
+    Args:
+        user_text (str): Raw natural language description from the user
+                         (e.g. 'my vpn keeps dropping every hour').
+
+    Returns:
+        dict: Best matching category, topic, confidence score, and KB article id.
+              Returns category='unknown' if no symptoms match.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, category, topic, symptoms FROM knowledge_base;")
+    rows = cursor.fetchall()
+    conn.close()
+
+    normalized_input = user_text.lower()
+    # Tokenize the input into individual words for flexible matching
+    input_tokens = set(re.findall(r"\b\w+\b", normalized_input))
+    best_match = {"category": "unknown", "topic": None, "kb_id": None, "score": 0, "matched_keywords": []}
+
+    for row in rows:
+        symptoms = json.loads(row["symptoms"])
+        matched = []
+        for kw in symptoms:
+            # A keyword phrase matches if ALL its tokens appear anywhere in the user input
+            kw_tokens = set(re.findall(r"\b\w+\b", kw.lower()))
+            if kw_tokens and kw_tokens.issubset(input_tokens):
+                matched.append(kw)
+        # Score = total number of matched keyword tokens (rewards more specific matches)
+        score = sum(len(re.findall(r"\b\w+\b", kw)) for kw in matched)
+        if score > best_match["score"]:
+            best_match = {
+                "category": row["category"],
+                "topic": row["topic"],
+                "kb_id": row["id"],
+                "score": score,
+                "matched_keywords": matched
+            }
+
+    if best_match["score"] == 0:
+        return {
+            "category": "unknown",
+            "topic": None,
+            "kb_id": None,
+            "score": 0,
+            "matched_keywords": [],
+            "message": "No matching symptom keywords found. Agent will ask user for clarification."
+        }
+
+    return best_match
+
+
+# ==========================================
 # 2. ANALYSIS TOOL
 # ==========================================
 def analyze_diagnostic_input(issue_type: str, user_input: str, username: str = None) -> dict:
@@ -352,9 +458,82 @@ def execute_helpdesk_action(action_type: str, username: str, details: dict = Non
             "message": f"Ticket #{ticket_id} has been marked as Resolved."
         }
         
+    elif action_type == "escalate_ticket":
+        ticket_id = details.get("ticket_id")
+        reason = details.get("reason", "No escalation reason provided.")
+        if not ticket_id:
+            return {"status": "failed", "message": "Missing 'ticket_id' for escalation."}
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Append escalation reason to steps_taken log
+        cursor.execute("SELECT steps_taken FROM tickets WHERE ticket_id = ?;", (ticket_id,))
+        row = cursor.fetchone()
+        existing_steps = json.loads(row["steps_taken"]) if row else []
+        existing_steps.append(f"[ESCALATED] {reason}")
+
+        cursor.execute("""
+        UPDATE tickets
+        SET resolution_status = 'Escalated', steps_taken = ?, resolved_at = datetime('now', 'localtime')
+        WHERE ticket_id = ?;
+        """, (json.dumps(existing_steps), ticket_id))
+        conn.commit()
+        conn.close()
+
+        return {
+            "status": "success",
+            "action": "escalate_ticket",
+            "ticket_id": ticket_id,
+            "message": f"Ticket #{ticket_id} escalated to Tier-2 support. Reason: {reason}"
+        }
+
     return {
         "status": "failed",
         "message": f"Unsupported action type: '{action_type}'."
+    }
+
+
+# ==========================================
+# 3b. APPEND TICKET STEP TOOL
+# ==========================================
+def append_ticket_step(ticket_id: int, step: str) -> dict:
+    """
+    Appends a single diagnostic step string to an existing ticket's steps_taken log.
+    Called incrementally by graph nodes as the session progresses so the ticket
+    always reflects the latest state of the conversation.
+
+    Args:
+        ticket_id (int): The target ticket record.
+        step (str): A short description of the diagnostic action just taken.
+
+    Returns:
+        dict: Success confirmation or error details.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT steps_taken FROM tickets WHERE ticket_id = ?;", (ticket_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        return {"status": "failed", "message": f"Ticket #{ticket_id} not found."}
+
+    existing_steps = json.loads(row["steps_taken"])
+    existing_steps.append(step)
+
+    cursor.execute(
+        "UPDATE tickets SET steps_taken = ? WHERE ticket_id = ?;",
+        (json.dumps(existing_steps), ticket_id)
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "ticket_id": ticket_id,
+        "steps_count": len(existing_steps),
+        "message": f"Step appended to Ticket #{ticket_id}: '{step}'"
     }
 
 
