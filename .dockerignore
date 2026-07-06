@@ -1,0 +1,14 @@
+.git
+.env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+helpdesk.db
+e2e_test.db
+e2e_edge_test.db
+.streamlit/

@@ -34,6 +34,12 @@ class AgentState(TypedDict):
         iterations:           Counter of how many times run_diagnosis_node has executed.
                               Bounded at MAX_ITERATIONS (5) to prevent infinite loops.
         final_report:         The completed markdown triage report string.
+        username_not_found:   Temporarily set to a username string when the user provides
+                              a username that was not found in the employee directory.
+                              Cleared by gather_info_node after informing the user.
+        guidance_presented:   True after the agent has shown KB troubleshooting steps to
+                              the user and is waiting for them to confirm resolution.
+        user_confirmed_resolved: True if the user says their issue is fixed after guidance.
     """
     messages: Annotated[list[BaseMessage], add_messages]
     username: Optional[str]
@@ -50,3 +56,6 @@ class AgentState(TypedDict):
     steps_taken: list
     iterations: int
     final_report: Optional[str]
+    username_not_found: Optional[str]
+    guidance_presented: bool
+    user_confirmed_resolved: Optional[bool]

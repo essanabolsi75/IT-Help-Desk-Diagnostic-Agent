@@ -196,12 +196,62 @@ def orchestrate_node(state: AgentState) -> dict:
       - Recompute the missing_fields list.
     Routing is handled by the conditional edge function route_from_orchestrate().
     """
-    # Guard: if waiting for confirmation, do nothing — let route handle it
+    # Guard: if waiting for confirmation, do nothing -- let route handle it
     if state.get("pending_confirmation"):
         return {}
 
     updates: dict = {}
     last_message = state["messages"][-1].content if state.get("messages") else ""
+
+    # Guard: if a report was already generated, this is a NEW issue in the same conversation thread.
+    # We must reset the diagnostic state variables so they don't leak into the new issue.
+    # Note: We keep username and device_id so the user doesn't have to re-authenticate.
+    if state.get("final_report"):
+        reset_fields = {
+            "intent": None,
+            "kb_topic": None,
+            "kb_id": None,
+            "gathered_info": {},
+            "missing_fields": [],
+            "pending_confirmation": False,
+            "pending_action": None,
+            "ticket_id": None,
+            "latest_tool_result": {},
+            "steps_taken": [],
+            "iterations": 0,
+            "final_report": None,
+            "guidance_presented": False,
+            "user_confirmed_resolved": None,
+        }
+        updates.update(reset_fields)
+        # Update local state dict so the rest of this node sees the cleared fields
+        state.update(reset_fields)
+
+    # Guard: if we presented guidance and are waiting for user's resolution answer
+    if state.get("guidance_presented"):
+        last_msg_lower = last_message.lower()
+        # Check if user says issue is resolved or not
+        resolved_words = {"yes", "resolved", "fixed", "working", "works", "solved", "good", "great", "done", "yep", "yeah"}
+        not_resolved_words = {"no", "not", "still", "nope", "didn't", "doesnt", "doesn't", "same", "issue", "problem", "broken"}
+        
+        has_resolved = any(w in last_msg_lower.split() for w in resolved_words)
+        has_not_resolved = any(w in last_msg_lower.split() for w in not_resolved_words)
+        
+        if has_resolved and not has_not_resolved:
+            return {"user_confirmed_resolved": True, "guidance_presented": False}
+        elif has_not_resolved:
+            return {"user_confirmed_resolved": False, "guidance_presented": False}
+        else:
+            # Ambiguous -- ask Gemini to interpret
+            parse_prompt = (
+                f"The user was asked if their IT issue was resolved after troubleshooting steps.\n"
+                f"Their reply was: \"{last_message}\"\n"
+                f"Did they say the issue is resolved? Reply with ONLY: yes or no"
+            )
+            answer = llm_invoke_with_retry([HumanMessage(content=parse_prompt)]).strip().lower()
+            is_resolved = answer == "yes"
+            return {"user_confirmed_resolved": is_resolved, "guidance_presented": False}
+        return {}
 
     # -- Step 1: Classify intent ----------------------------------------------
     if not state.get("intent") or state.get("intent") == "unknown":
@@ -258,15 +308,18 @@ def orchestrate_node(state: AgentState) -> dict:
                 gathered = dict(state.get("gathered_info") or {})
                 gathered["user_data"] = user_data
                 updates["gathered_info"] = gathered
+            else:
+                # Bug 2 fix: username was provided but not found in DB.
+                # Set a flag so gather_info_node can inform the user.
+                updates["username_not_found"] = candidate
 
     # -- Step 3: Fill in gathered fields from user message --------------------
-    # Only populate the field that the user was actually prompted for in the previous turn.
-    # This prevents the user's username response from being eaten as ping_result.
     current_username = updates.get("username", state.get("username"))
     current_gathered = dict(state.get("gathered_info") or {})
     previous_missing = state.get("missing_fields") or []
 
     if previous_missing:
+        # Only populate the field that the user was actually prompted for
         prompted_field = previous_missing[0]
         if prompted_field != "username" and prompted_field not in current_gathered:
             if prompted_field in ("ping_result", "disk_space"):
@@ -275,10 +328,22 @@ def orchestrate_node(state: AgentState) -> dict:
                 code = _extract_error_code(last_message)
                 if code:
                     current_gathered[prompted_field] = code
+    else:
+        # Bug 1 fix: First turn — no previous prompts yet.
+        # Opportunistically extract error_code from the initial problem description
+        # so it isn't lost when the user mentions it upfront.
+        if current_intent == "bsod" and "error_code" not in current_gathered:
+            code = _extract_error_code(last_message)
+            if code:
+                current_gathered["error_code"] = code
+        elif current_intent == "update_error" and "error_code" not in current_gathered:
+            code = _extract_error_code(last_message)
+            if code:
+                current_gathered["error_code"] = code
 
     updates["gathered_info"]  = current_gathered
 
-    # ── Step 4: Recompute missing fields ─────────────────────────────────────
+    # -- Step 4: Recompute missing fields -------------------------------------
     updates["missing_fields"] = _compute_missing_fields(
         current_intent, current_username, current_gathered
     )
@@ -318,7 +383,17 @@ def gather_info_node(state: AgentState) -> dict:
     field_hint = FIELD_PROMPTS.get(next_field, f"Please provide your {next_field}.")
     last_user  = state["messages"][-1].content if state.get("messages") else ""
 
-    # First time gathering for this intent — fetch KB diagnostic steps to reference
+    # Bug 2 fix: If a username lookup just failed, prepend a warning
+    username_warning = ""
+    bad_username = state.get("username_not_found")
+    if bad_username and next_field == "username":
+        username_warning = (
+            f"IMPORTANT: The user just provided the username '{bad_username}' but it was "
+            f"NOT FOUND in the employee directory. You MUST inform them that the username "
+            f"was not recognized and ask them to double-check and provide a valid one.\n\n"
+        )
+
+    # First time gathering for this intent -- fetch KB diagnostic steps to reference
     kb_context = ""
     if state.get("kb_topic") and not state.get("steps_taken"):
         kb_results = query_knowledge_base(topic=state["kb_topic"])
@@ -327,6 +402,7 @@ def gather_info_node(state: AgentState) -> dict:
             kb_context = "\nDiagnostic protocol from Knowledge Base:\n" + "\n".join(f"  - {s}" for s in steps)
 
     context_prompt = (
+        f"{username_warning}"
         f"The user said: \"{last_user}\"\n"
         f"Intent classified: {state.get('intent', 'unknown')}\n"
         f"{kb_context}\n\n"
@@ -340,7 +416,7 @@ def gather_info_node(state: AgentState) -> dict:
         SystemMessage(content=get_system_prompt()),
         HumanMessage(content=context_prompt),
     ])
-    return {"messages": [AIMessage(content=response)]}
+    return {"messages": [AIMessage(content=response)], "username_not_found": None}
 
 
 # ─────────────────────────────────────────────
@@ -397,6 +473,66 @@ def run_diagnosis_node(state: AgentState) -> dict:
         "steps_taken":         steps,
         "pending_action":      pending_action,
         "pending_confirmation": pending_confirmation,
+    }
+
+# ─────────────────────────────────────────────
+# 4b. PRESENT GUIDANCE NODE (new)
+# ─────────────────────────────────────────────
+def present_guidance_node(state: AgentState) -> dict:
+    """
+    After initial diagnosis, presents KB troubleshooting steps to the user
+    and asks them to try the suggested fixes. Waits for the user to report
+    whether the issue is resolved before escalating or closing.
+    """
+    intent = state.get("intent", "unknown")
+    tool_result = state.get("latest_tool_result") or {}
+    username = state.get("username", "")
+    kb_topic = state.get("kb_topic")
+    detected_issue = tool_result.get("detected_issue", "An issue was detected.")
+    recommended_fix = tool_result.get("recommended_fix", "")
+    details = tool_result.get("details", {})
+
+    # Fetch KB diagnostic steps
+    kb_steps = []
+    if kb_topic:
+        kb_results = query_knowledge_base(topic=kb_topic)
+        if kb_results:
+            kb_steps = kb_results[0].get("diagnostic_steps", [])
+
+    # Build a context prompt for Gemini to generate a helpful, conversational response
+    steps_text = ""
+    if kb_steps:
+        steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(kb_steps))
+
+    context_prompt = (
+        f"You are an IT help-desk agent. You just ran diagnostics for a '{intent}' issue.\n"
+        f"Diagnostic finding: {detected_issue}\n"
+        f"Recommended fix: {recommended_fix}\n\n"
+    )
+    if steps_text:
+        context_prompt += (
+            f"The Knowledge Base provides these troubleshooting steps:\n{steps_text}\n\n"
+        )
+    context_prompt += (
+        f"Write a professional response that:\n"
+        f"1. Tells the user what the diagnosis found\n"
+        f"2. Presents the troubleshooting steps they should try\n"
+        f"3. Asks them to try these steps and let you know if the issue is resolved\n\n"
+        f"Be concise but thorough. Use markdown formatting for readability."
+    )
+
+    response = llm_invoke_with_retry([
+        SystemMessage(content=get_system_prompt()),
+        HumanMessage(content=context_prompt),
+    ])
+
+    steps = list(state.get("steps_taken") or [])
+    steps.append(f"[GUIDANCE] Presented troubleshooting steps to user for: {intent}")
+
+    return {
+        "messages": [AIMessage(content=response)],
+        "guidance_presented": True,
+        "steps_taken": steps,
     }
 
 
@@ -556,12 +692,21 @@ def generate_report_node(state: AgentState) -> dict:
     max_iter_exceeded = iterations >= MAX_ITERATIONS
 
     should_escalate = needs_specialist or max_iter_exceeded
+    user_resolved   = state.get("user_confirmed_resolved")
+
+    if user_resolved is True:
+        should_escalate = False
+    elif user_resolved is False:
+        should_escalate = True
 
     if should_escalate:
         reason = (
             f"Issue unresolved after {iterations} diagnostic iteration(s). "
             f"Requires Tier-2 specialist for: {intent.upper()}."
         )
+        if user_resolved is False:
+            reason = f"User confirmed issue is still present after troubleshooting. Requires Tier-2 specialist for: {intent.upper()}."
+            
         execute_helpdesk_action("escalate_ticket", username, details={
             "ticket_id": ticket_id,
             "reason":    reason,
@@ -587,6 +732,11 @@ def route_from_orchestrate(state: AgentState) -> str:
     """After orchestrate: decide which node handles this turn."""
     if state.get("pending_confirmation"):
         return "handle_confirmation"
+
+    # Post-guidance: user has responded whether their issue is resolved
+    if state.get("user_confirmed_resolved") is not None:
+        return "generate_report"
+
     intent = state.get("intent", "unknown")
     if not intent or intent == "unknown":
         return "chitchat"
@@ -598,10 +748,11 @@ def route_from_orchestrate(state: AgentState) -> str:
 
 
 def route_from_diagnosis(state: AgentState) -> str:
-    """After run_diagnosis: go to ask confirmation or generate report."""
+    """After run_diagnosis: go to ask confirmation, present guidance, or generate report."""
     if state.get("pending_confirmation"):
         return "ask_confirmation"
-    return "generate_report"
+    # Instead of going straight to report, present troubleshooting guidance first
+    return "present_guidance"
 
 
 def route_from_confirmation(state: AgentState) -> str:
@@ -635,6 +786,7 @@ def build_graph():
     builder.add_node("handle_confirmation",  handle_confirmation_node)
     builder.add_node("execute_action",       execute_action_node)
     builder.add_node("generate_report",      generate_report_node)
+    builder.add_node("present_guidance",     present_guidance_node)
 
     # Entry point
     builder.set_entry_point("orchestrate")
@@ -656,6 +808,7 @@ def build_graph():
     builder.add_edge("chitchat",         END)
     builder.add_edge("gather_info",      END)
     builder.add_edge("ask_confirmation", END)
+    builder.add_edge("present_guidance", END)
 
     # Conditional routing from run_diagnosis
     builder.add_conditional_edges(
@@ -663,6 +816,7 @@ def build_graph():
         route_from_diagnosis,
         {
             "ask_confirmation": "ask_confirmation",
+            "present_guidance": "present_guidance",
             "generate_report":  "generate_report",
         },
     )

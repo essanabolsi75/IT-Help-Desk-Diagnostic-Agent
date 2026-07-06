@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  agent-ui:
+    build: .
+    container_name: helpdesk-agent
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Mount a local directory to persist the SQLite database outside the container
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/helpdesk.db
+    restart: unless-stopped
