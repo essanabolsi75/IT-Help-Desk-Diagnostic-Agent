@@ -229,18 +229,45 @@ def orchestrate_node(state: AgentState) -> dict:
 
     # Guard: if we presented guidance and are waiting for user's resolution answer
     if state.get("guidance_presented"):
-        # Use LLM to interpret if the issue is resolved or not, rather than brittle word matching
+        # Find the last AI message to give the LLM the question context
+        last_agent_msg = ""
+        for msg in reversed(state.get("messages", [])):
+            if hasattr(msg, "type") and msg.type == "ai":
+                last_agent_msg = msg.content[:400]  # truncate long guidance messages
+                break
+
         parse_prompt = (
-            f"The user was provided IT troubleshooting steps for their issue.\n"
-            f"Their reply was: \"{last_message}\"\n"
-            f"Based on their reply, is the underlying issue fully RESOLVED/FIXED, or is it STILL BROKEN / UNRESOLVED / they just answered a question?\n"
-            f"Note: If they just say 'yes I see the error' or 'yes I did that' but don't say it's fixed, it is NOT resolved.\n"
-            f"Reply with ONLY: 'resolved' or 'unresolved'"
+            f"You are classifying a user's reply in an IT help-desk conversation.\n\n"
+            f"The agent just asked the user (paraphrased): "
+            f"\"Have the troubleshooting steps resolved your issue?\"\n"
+            f"Agent's last message (excerpt): \"{last_agent_msg}\"\n\n"
+            f"User's reply: \"{last_message}\"\n\n"
+            f"Rules:\n"
+            f"- A simple 'yes', 'yep', 'it works', 'fixed', 'resolved', 'all good', "
+            f"'working now' means RESOLVED.\n"
+            f"- 'no', 'still broken', 'same issue', 'didn't work', 'not fixed' means UNRESOLVED.\n"
+            f"- Only say UNRESOLVED if the user clearly indicates the problem persists.\n\n"
+            f"Reply with ONLY one word: 'resolved' or 'unresolved'"
         )
         answer = llm_invoke_with_retry([HumanMessage(content=parse_prompt)]).strip().lower()
-        
-        # Default to unresolved if the model says anything weird
-        is_resolved = "resolved" in answer and "unresolved" not in answer
+
+        # Default to resolved for clear affirmative single-word answers (safety net)
+        tokens = set(answer.split())
+        if answer == "resolved" or ("resolved" in tokens and "unresolved" not in tokens):
+            is_resolved = True
+        elif "unresolved" in tokens:
+            is_resolved = False
+        else:
+            # LLM returned something unexpected — fall back to keyword check on user message
+            yes_words = {"yes", "yep", "yeah", "fixed", "resolved", "working", "works",
+                         "solved", "great", "good", "done", "all good", "it works"}
+            no_words  = {"no", "nope", "not", "still", "broken", "same", "didn't",
+                         "doesn't", "issue", "problem"}
+            user_tokens = set(last_message.lower().split())
+            has_yes = bool(user_tokens & yes_words)
+            has_no  = bool(user_tokens & no_words)
+            is_resolved = has_yes and not has_no
+
         return {"user_confirmed_resolved": is_resolved, "guidance_presented": False}
 
     # -- Step 1: Classify intent ----------------------------------------------
@@ -470,45 +497,56 @@ def run_diagnosis_node(state: AgentState) -> dict:
 # ─────────────────────────────────────────────
 def present_guidance_node(state: AgentState) -> dict:
     """
-    After initial diagnosis, presents KB troubleshooting steps to the user
-    and asks them to try the suggested fixes. Waits for the user to report
-    whether the issue is resolved before escalating or closing.
+    After initial diagnosis (or after a sensitive action is executed), presents
+    KB resolution steps to the user and asks if the issue is now resolved.
+    The conversation does NOT end until the user confirms resolution or failure.
     """
     intent = state.get("intent", "unknown")
     tool_result = state.get("latest_tool_result") or {}
-    username = state.get("username", "")
     kb_topic = state.get("kb_topic")
     detected_issue = tool_result.get("detected_issue", "An issue was detected.")
     recommended_fix = tool_result.get("recommended_fix", "")
-    details = tool_result.get("details", {})
 
-    # Fetch KB diagnostic steps
-    kb_steps = []
+    # After a successful action (e.g. account unlock), the tool result carries a message
+    action_message = tool_result.get("message", "")
+
+    # Fetch KB *resolution* steps (not diagnostic steps — diagnosis already ran)
+    kb_resolution_steps = []
+    kb_diagnostic_steps = []
     if kb_topic:
         kb_results = query_knowledge_base(topic=kb_topic)
         if kb_results:
-            kb_steps = kb_results[0].get("diagnostic_steps", [])
+            kb_resolution_steps = kb_results[0].get("resolution_steps", [])
+            kb_diagnostic_steps  = kb_results[0].get("diagnostic_steps", [])
 
-    # Build a context prompt for Gemini to generate a helpful, conversational response
+    # Prefer resolution steps; fall back to diagnostic steps if none
+    kb_steps = kb_resolution_steps if kb_resolution_steps else kb_diagnostic_steps
+
     steps_text = ""
     if kb_steps:
         steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(kb_steps))
 
     context_prompt = (
-        f"You are an IT help-desk agent. You just ran diagnostics for a '{intent}' issue.\n"
+        f"You are an IT help-desk agent. You just finished diagnostics for a '{intent}' issue.\n"
         f"Diagnostic finding: {detected_issue}\n"
-        f"Recommended fix: {recommended_fix}\n\n"
     )
+    if action_message:
+        context_prompt += f"Action taken: {action_message}\n"
+    if recommended_fix:
+        context_prompt += f"Recommended fix: {recommended_fix}\n"
+    context_prompt += "\n"
+
     if steps_text:
         context_prompt += (
-            f"The Knowledge Base provides these troubleshooting steps:\n{steps_text}\n\n"
+            f"The Knowledge Base provides these resolution steps for the user:\n{steps_text}\n\n"
         )
+
     context_prompt += (
-        f"Write a professional response that:\n"
-        f"1. Tells the user what the diagnosis found\n"
-        f"2. Presents the troubleshooting steps they should try\n"
-        f"3. Asks them to try these steps and let you know if the issue is resolved\n\n"
-        f"Be concise but thorough. Use markdown formatting for readability."
+        f"Write a professional, friendly response that:\n"
+        f"1. Briefly summarises what the diagnosis found (or what action was just taken)\n"
+        f"2. Lists the resolution steps the user should try NOW\n"
+        f"3. Ends by asking: 'Has this resolved your issue?' so you know whether to close or escalate\n\n"
+        f"Be concise. Use markdown formatting."
     )
 
     response = llm_invoke_with_retry([
@@ -517,7 +555,7 @@ def present_guidance_node(state: AgentState) -> dict:
     ])
 
     steps = list(state.get("steps_taken") or [])
-    steps.append(f"[GUIDANCE] Presented troubleshooting steps to user for: {intent}")
+    steps.append(f"[GUIDANCE] Presented resolution steps to user for: {intent}")
 
     return {
         "messages": [AIMessage(content=response)],
@@ -648,7 +686,7 @@ def generate_report_node(state: AgentState) -> dict:
     Resolved or Escalated based on diagnostic outcomes and iteration count,
     then generates and returns the markdown triage report.
     """
-    username    = state.get("username") or "unknown"
+    username    = state.get("username")   # may be None — create_ticket handles FK safely
     device_id   = state.get("device_id")
     intent      = state.get("intent") or "general"
     steps       = list(state.get("steps_taken") or [])
@@ -741,7 +779,10 @@ def route_from_diagnosis(state: AgentState) -> str:
     """After run_diagnosis: go to ask confirmation, present guidance, or generate report."""
     if state.get("pending_confirmation"):
         return "ask_confirmation"
-    # Instead of going straight to report, present troubleshooting guidance first
+    # If guidance was already shown this session, go straight to report
+    # (avoids presenting the same tips twice in a loop)
+    if state.get("guidance_presented"):
+        return "generate_report"
     return "present_guidance"
 
 
@@ -821,8 +862,9 @@ def build_graph():
         },
     )
 
-    # Linear edges
-    builder.add_edge("execute_action",  "generate_report")
+    # After executing an action (e.g. unlock), ask the user if it resolved the issue
+    # rather than jumping straight to the final report
+    builder.add_edge("execute_action",  "present_guidance")
     builder.add_edge("generate_report", END)
 
     # Compile with in-memory state persistence

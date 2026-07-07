@@ -410,24 +410,54 @@ def execute_helpdesk_action(action_type: str, username: str, details: dict = Non
         symptoms = details.get("symptoms", "No description provided.")
         steps_taken_list = details.get("steps_taken", [])
         status = details.get("resolution_status", "Open")
-        
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
+        # Validate username FK: only use it if the user actually exists in the DB.
+        # If not, set to None — the tickets table has username NOT NULL so we use
+        # a special sentinel 'guest' row, or we remap unknown to None safely by
+        # checking first and using the literal string only if valid.
+        safe_username = None
+        if username:
+            cursor.execute("SELECT 1 FROM users WHERE username = ?;", (username,))
+            if cursor.fetchone():
+                safe_username = username
+
+        # Validate device_id FK too
+        safe_device_id = None
+        if device_id:
+            cursor.execute("SELECT 1 FROM devices WHERE device_id = ?;", (device_id,))
+            if cursor.fetchone():
+                safe_device_id = device_id
+
+        # tickets.username is NOT NULL — use the validated username or a fallback
+        insert_username = safe_username if safe_username else (username or "guest")
+
+        # Ensure the fallback username exists (insert a guest row if needed)
+        if not safe_username:
+            cursor.execute("SELECT 1 FROM users WHERE username = ?;", (insert_username,))
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO users (username, full_name, email, department) "
+                    "VALUES (?, 'Guest / Unverified', 'unknown@company.com', 'Unknown');",
+                    (insert_username,)
+                )
+
         cursor.execute("""
         INSERT INTO tickets (username, device_id, category, symptoms, steps_taken, resolution_status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, datetime('now', 'localtime'));
-        """, (username, device_id, category, symptoms, json.dumps(steps_taken_list), status))
-        
+        """, (insert_username, safe_device_id, category, symptoms, json.dumps(steps_taken_list), status))
+
         ticket_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        
+
         return {
             "status": "success",
             "action": "create_ticket",
             "ticket_id": ticket_id,
-            "message": f"Incident Ticket #{ticket_id} created successfully for '{username}' (Status: {status})."
+            "message": f"Incident Ticket #{ticket_id} created successfully for '{insert_username}' (Status: {status})."
         }
         
     elif action_type == "resolve_ticket":
