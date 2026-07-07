@@ -229,29 +229,19 @@ def orchestrate_node(state: AgentState) -> dict:
 
     # Guard: if we presented guidance and are waiting for user's resolution answer
     if state.get("guidance_presented"):
-        last_msg_lower = last_message.lower()
-        # Check if user says issue is resolved or not
-        resolved_words = {"yes", "resolved", "fixed", "working", "works", "solved", "good", "great", "done", "yep", "yeah"}
-        not_resolved_words = {"no", "not", "still", "nope", "didn't", "doesnt", "doesn't", "same", "issue", "problem", "broken"}
+        # Use LLM to interpret if the issue is resolved or not, rather than brittle word matching
+        parse_prompt = (
+            f"The user was provided IT troubleshooting steps for their issue.\n"
+            f"Their reply was: \"{last_message}\"\n"
+            f"Based on their reply, is the underlying issue fully RESOLVED/FIXED, or is it STILL BROKEN / UNRESOLVED / they just answered a question?\n"
+            f"Note: If they just say 'yes I see the error' or 'yes I did that' but don't say it's fixed, it is NOT resolved.\n"
+            f"Reply with ONLY: 'resolved' or 'unresolved'"
+        )
+        answer = llm_invoke_with_retry([HumanMessage(content=parse_prompt)]).strip().lower()
         
-        has_resolved = any(w in last_msg_lower.split() for w in resolved_words)
-        has_not_resolved = any(w in last_msg_lower.split() for w in not_resolved_words)
-        
-        if has_resolved and not has_not_resolved:
-            return {"user_confirmed_resolved": True, "guidance_presented": False}
-        elif has_not_resolved:
-            return {"user_confirmed_resolved": False, "guidance_presented": False}
-        else:
-            # Ambiguous -- ask Gemini to interpret
-            parse_prompt = (
-                f"The user was asked if their IT issue was resolved after troubleshooting steps.\n"
-                f"Their reply was: \"{last_message}\"\n"
-                f"Did they say the issue is resolved? Reply with ONLY: yes or no"
-            )
-            answer = llm_invoke_with_retry([HumanMessage(content=parse_prompt)]).strip().lower()
-            is_resolved = answer == "yes"
-            return {"user_confirmed_resolved": is_resolved, "guidance_presented": False}
-        return {}
+        # Default to unresolved if the model says anything weird
+        is_resolved = "resolved" in answer and "unresolved" not in answer
+        return {"user_confirmed_resolved": is_resolved, "guidance_presented": False}
 
     # -- Step 1: Classify intent ----------------------------------------------
     if not state.get("intent") or state.get("intent") == "unknown":
