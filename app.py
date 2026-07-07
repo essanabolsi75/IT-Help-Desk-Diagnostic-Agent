@@ -297,15 +297,10 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.rerun()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Reset DB", use_container_width=True):
-            initialize_database()
-            st.toast("Database tables reset.")
-    with col2:
-        if st.button("Seed Data", use_container_width=True):
-            seed_database()
-            st.toast("Mock data seeded.")
+    if st.button("🔄 Reset Database", use_container_width=True):
+        initialize_database()
+        seed_database()
+        st.toast("Database reset to default mock values.")
 
     # ── Quick Scenarios ──
     st.markdown("### Quick Scenarios")
