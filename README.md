@@ -19,7 +19,6 @@ The interface will be exposed locally at:
 Before running, copy `.env.example` to `.env` and configure your API key:
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
-DB_PATH=/app/data/helpdesk.db
 ```
 
 ---
